@@ -59,12 +59,22 @@ type Rejection struct {
 	Detail   string       `json:"detail"` // 关键判定依据（各站点逐项评估结果）
 }
 
-// State 是联邦的持久化状态：站点、期望负载、已放置实例、拒绝记录。
+// WorkloadStatus 描述一个负载相对最新声明的收敛情况（每轮协调后重算）。
+type WorkloadStatus struct {
+	Desired   int      `json:"desired"`             // 期望副本数
+	Placed    int      `json:"placed"`              // 已放置实例数
+	Pending   int      `json:"pending"`             // 未放置缺口数
+	Converged bool     `json:"converged"`           // 是否已按最新声明收敛（无缺口）
+	Migrated  []string `json:"migrated,omitempty"`  // 本轮被迁走的实例："id: 旧站点->新站点"
+}
+
+// State 是联邦的持久化状态：站点、期望负载、已放置实例、拒绝记录、收敛状态。
 type State struct {
-	Sites      map[string]*Site         `json:"sites"`
-	Desired    map[string]*WorkloadSpec `json:"desired"`
-	Instances  map[string]*Instance     `json:"instances"` // key: Instance.ID
-	Rejections []Rejection              `json:"rejections,omitempty"`
+	Sites      map[string]*Site           `json:"sites"`
+	Desired    map[string]*WorkloadSpec   `json:"desired"`
+	Instances  map[string]*Instance       `json:"instances"` // key: Instance.ID
+	Rejections []Rejection                `json:"rejections,omitempty"`
+	Status     map[string]*WorkloadStatus `json:"status,omitempty"` // key: 负载名
 }
 
 // NewState 返回空状态。
@@ -73,5 +83,6 @@ func NewState() *State {
 		Sites:     map[string]*Site{},
 		Desired:   map[string]*WorkloadSpec{},
 		Instances: map[string]*Instance{},
+		Status:    map[string]*WorkloadStatus{},
 	}
 }

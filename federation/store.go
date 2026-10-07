@@ -41,6 +41,9 @@ func (s *Store) Load() (*State, error) {
 	if st.Instances == nil {
 		st.Instances = map[string]*Instance{}
 	}
+	if st.Status == nil {
+		st.Status = map[string]*WorkloadStatus{}
+	}
 	return st, nil
 }
 

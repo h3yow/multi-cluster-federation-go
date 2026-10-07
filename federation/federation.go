@@ -113,5 +113,10 @@ func deepCopy(st *State) *State {
 		out.Instances[k] = &c
 	}
 	out.Rejections = append([]Rejection(nil), st.Rejections...)
+	for k, v := range st.Status {
+		c := *v
+		c.Migrated = append([]string(nil), v.Migrated...)
+		out.Status[k] = &c
+	}
 	return out
 }
