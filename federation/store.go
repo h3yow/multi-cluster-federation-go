@@ -41,6 +41,13 @@ func (s *Store) Load() (*State, error) {
 	if st.Instances == nil {
 		st.Instances = map[string]*Instance{}
 	}
+	// 兼容旧版本落盘文件：新增字段缺失时补空 map。
+	if st.Generation == nil {
+		st.Generation = map[string]int{}
+	}
+	if st.Statuses == nil {
+		st.Statuses = map[string]*WorkloadStatus{}
+	}
 	return st, nil
 }
 

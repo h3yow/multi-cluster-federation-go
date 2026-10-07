@@ -21,6 +21,8 @@ go test -v -run TestFailoverAndRecovery ./...   # 查看故障迁移判定日志
 | 期望状态 | `WorkloadSpec` | 声明式负载：`Replicas`、`Size`（每实例容量）、`Selector`（标签约束）、`MutexKey`（互斥） |
 | 实例 | `Instance` | 已放置实例，ID 由 `负载名-序号` 确定性派生 |
 | 拒绝 | `Rejection` | 放置失败记录，含可区分原因与逐项判定依据 |
+| 迁移 | `Migration` | 一轮协调中按最新声明被迁走的实例（身份不变，含迁出/迁入站点与原因） |
+| 负载状态 | `WorkloadStatus` | 每个负载是否已按最新声明收敛、当前副本/缺口数、本轮迁移、期望/已观测代次 |
 | 门面 | `Federation` | 串行化所有变更与协调，每轮协调后整体落盘 |
 
 ## 放置规则
@@ -47,6 +49,43 @@ go test -v -run TestFailoverAndRecovery ./...   # 查看故障迁移判定日志
 `Rejection.Detail` 记录每个站点逐项评估结果（如
 `容量不足: edge-a(free=1,need=2)`），作为关键判定依据。
 
+## 运行中调整声明（更新语义）
+
+对一个已经在跑的负载再次 `Apply`（修改 `Size`、`MutexKey`、`Selector` 或
+`Replicas`）即可**原地更新**，无需删除重建。下一轮协调会让所有存量实例按
+**最新声明**重新判定：
+
+1. **身份不变**：实例 ID 仍是 `负载名-序号`。更新只会原地改 `Size/MutexKey`
+   或把实例迁到别的站点，既不会凭空多出实例，也不会弄丢本来没问题的实例。
+2. **能留则留（最小扰动）**：站点仍 Active、标签仍满足、按最新 `Size/MutexKey`
+   在全局视角下放得下的实例，留在原站点，仅把规格更新为最新值。
+3. **不满足则迁/欠**：放不下或互斥冲突的实例先腾出（**绝不先临时超配**），
+   再按确定性规则尝试其他可行站点；仍放不下的记为可解释缺口 `Rejection`。
+4. **结论稳定**：同一份声明反复协调结论幂等，实例不会来回挪；迁移记录
+   `Statuses[wl].Migrations` 在收敛后的下一轮即为空，表示调整已跑完。
+
+实现上每轮协调是**全局三阶段**且跨负载共用一个调度视角（容量/互斥强一致）：
+
+1. 清理：删除不再期望的负载；缩容移除高序号实例；移除站点失效/排空/不存在、
+   标签不再匹配的实例；
+2. **保留重评**（按 负载名升序、序号升序）：存活实例以“只计已确认保留实例”
+   的视角逐个按最新声明提交，放不下/互斥冲突的腾出；
+3. **补放缺口**（同序）：确定性选站，记录迁移与拒绝原因；最后重算收敛状态。
+
+### 代次与收敛状态
+
+- `State.Generation[wl]`：声明**内容**真正变化时由 `Apply` 递增；
+  以完全相同的声明重复 `Apply` 不递增、不触发迁移（可安全重试）。
+- `State.Statuses[wl]`（`WorkloadStatus`，每轮整体重算）：
+  - `Converged`：期望序号是否全部按最新声明放置、无缺口；
+  - `Replicas` / `Rejected`：当前按最新规格放置的实例数 / 本轮仍欠的实例数；
+  - `DesiredGeneration` / `ObservedGeneration`：收敛时两者相等；
+    仍有缺口时 `Observed = Desired - 1`，据此可一眼看出调整是否跑完；
+  - `Migrations`：**本轮**被迁走的实例（`InstanceID/From/To/Reason`），
+    收敛后清空，方便核对这次调整到底影响了谁。
+- 任意时刻对每个负载都有 `已放置数 + 缺口数 == 期望副本数`，
+  且按最新声明统计的站点占用绝不超过站点容量。
+
 ## 故障与恢复语义
 
 - **Failed**：站点上实例视为丢失，下一轮协调在仍满足约束的站点上按原
@@ -55,33 +94,56 @@ go test -v -run TestFailoverAndRecovery ./...   # 查看故障迁移判定日志
 - **Draining**：不再接收新实例，存量实例被迁出至其他可行站点。
 - **恢复（Active）**：实例 ID 确定性派生（`负载名-序号`），协调只补缺口、
   不重复创建，因此恢复后不会出现重复实例，总数收敛回期望值。
-- **容量调小**：超配站点按实例 ID 降序逐出，直至不超载。
+- **容量调小 / 调大实例 Size**：按最新声明重评，全局视角放不下的实例腾出，
+  按 `(负载名升序, 序号升序)` 的确定性顺序处理，直至不超载；腾出的实例优先
+  迁到其他可行站点，否则记为缺口。
 
 ## 协调与并发语义
 
-`Reconcile` 每轮执行：删除不再期望的负载 → 缩容（高序号先删）→
-逐出失效实例（站点失效/标签不再匹配/互斥冲突/超配）→ 确定性补放缺口。
+`Reconcile` 每轮执行全局三阶段：清理（删除/缩容/站点失效/标签失效）→
+按最新声明重评保留（容量/互斥）→ 确定性补放缺口并记录迁移与收敛状态。
 
-- **幂等**：同一 `(State, Desired)` 重复协调结论（实例集合 + 拒绝记录）不变；
-  任何操作可安全重试，不放大副作用。
+- **幂等**：同一 `(State, Desired)` 重复协调结论（实例集合 + 拒绝记录 + 迁移）
+  不变；相同声明重复 `Apply` 不递增代次；任何操作可安全重试，不放大副作用。
 - **并发安全**：`Federation` 用互斥锁串行化所有写操作与周期协调，
-  扩容/缩容/更新/删除与站点事件可任意交织。
+  扩缩容/更新/删除与站点故障/恢复/周期协调可任意交织，不产生重复或丢失实例。
 - **持久化**：每轮协调后状态原子落盘（临时文件 + rename）；
   重新 `Open` 时先加载再协调一轮，重启后结论与落盘前一致。
 
+## 落盘状态兼容
+
+落盘文件是 `State` 的 JSON。新增字段（`Generation`、`Statuses` 及
+`Instance` 上的既有字段）均为**增量字段**：
+
+- 旧版本写出的、缺少 `generation`/`statuses` 的状态文件可直接加载，
+  加载时自动补空 map，下一轮协调即按最新逻辑重算并补出收敛状态；
+- 存量实例不要求带任何“代次”标记：重评只依据当前 `Desired` 与实例的
+  `负载名-序号` 身份，因此旧文件中的实例会被原样保留并在一轮内更新到新规格；
+- 不删除/重命名任何旧字段，旧读取方仍可解析。
+
 ## 验证方法
 
-`federation/federation_test.go` 覆盖：
+在本地验证更新语义：
+
+```bash
+go build ./...
+go test -v -run TestUpdate ./...          # 更新语义全部用例（含逐轮日志）
+go test -race -run TestUpdateConcurrent ./...  # 更新与故障/恢复并发的竞态验证
+```
+
+`federation/federation_test.go` 覆盖容量/标签/互斥/故障/排空/并发/持久化等
+基础行为；`federation/update_test.go` 专门覆盖运行中调整声明：
 
 | 用例 | 验证点 |
 |---|---|
-| `TestCapacityInsufficient` | 容量不足按原因拒绝、不超配、重复协调结论稳定 |
-| `TestLabelMismatch` / `TestMutexConflict` / `TestNoEligibleSite` | 三类约束失败原因可区分 |
-| `TestFailoverAndRecovery` | 故障重建不超容量、恢复后无重复、缺口可解释 |
-| `TestDrain` | 排空迁移 |
-| `TestConcurrentReconcile` | 期望变更与周期协调并发交织，无重复/丢失，重试为无操作 |
-| `TestPersistence` | 落盘重载后结论一致 |
-| `TestDeterministicPlacement` | 相同输入两次协调放置结果完全相同 |
+| `TestUpdateSizeFitsExactly` | 调大 Size 后容量**刚好够**：原地更新、不搬家、不超配、代次收敛、重复 Apply/协调无操作 |
+| `TestUpdateSizeTooBig` | 调大后**差一点放不下**：恰好 1 个可解释缺口（含逐站点依据）、身份不丢、反复协调不抖动、扩容后按原身份补齐 |
+| `TestUpdateSizeTriggersMigration` | 调大后原站点放不下、别的站点放得下：带原身份迁移，`Migrations` 记录 from/to/reason，收敛后清空 |
+| `TestUpdateMutexKey` | 运行中加互斥范围：原本同站实例必须分开（后序号迁出），去互斥不强制回迁 |
+| `TestUpdateMutexKeyNoRoom` | 加互斥但单站：`MutexConflict` 缺口，新增站点后按原身份补齐 |
+| `TestUpdateSizeCrossWorkload` | 调大一个负载 Size 时跨负载容量强一致、不超配（恰好放满） |
+| `TestUpdateConcurrent` | 更新与扩缩容/删除/站点故障恢复/周期协调并发：不重复不丢失、不超配、全部收敛 |
+| `TestPersistenceAfterUpdate` | 更新并迁移后落盘重载结论一致；旧版本落盘文件可加载并收敛 |
 
 测试日志通过 `t.Logf` 打印期望状态（如 `desired: 3x2`）与每个实例的
 放置/逐出/拒绝判定依据，`go test -v` 可见。

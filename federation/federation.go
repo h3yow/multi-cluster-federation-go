@@ -67,8 +67,15 @@ func (f *Federation) SetSiteState(name string, s SiteState) ([]string, error) {
 }
 
 // Apply 声明或更新一个期望负载（扩容/缩容/更新通过修改 Spec 字段表达）。
+// 当声明内容相对上一版发生变化（如调 Size、改 MutexKey/Selector、调副本数）时，
+// 该负载的 Generation 递增；下一轮协调会按最新声明重评存量实例。
+// 以完全相同的声明重复 Apply 不递增、不触发迁移，因此可安全重试。
 func (f *Federation) Apply(spec WorkloadSpec) ([]string, error) {
 	return f.mutate(func(st *State) {
+		old, existed := st.Desired[spec.Name]
+		if !existed || !specEqual(old, &spec) {
+			st.Generation[spec.Name]++
+		}
 		c := spec
 		st.Desired[spec.Name] = &c
 	})
@@ -113,5 +120,29 @@ func deepCopy(st *State) *State {
 		out.Instances[k] = &c
 	}
 	out.Rejections = append([]Rejection(nil), st.Rejections...)
+	for k, v := range st.Generation {
+		out.Generation[k] = v
+	}
+	for k, v := range st.Statuses {
+		c := *v
+		c.Migrations = append([]Migration(nil), v.Migrations...)
+		out.Statuses[k] = &c
+	}
 	return out
+}
+
+// specEqual 比较两份声明内容是否一致（map 按内容比较）。
+func specEqual(a, b *WorkloadSpec) bool {
+	if a.Name != b.Name || a.Replicas != b.Replicas || a.Size != b.Size || a.MutexKey != b.MutexKey {
+		return false
+	}
+	if len(a.Selector) != len(b.Selector) {
+		return false
+	}
+	for k, v := range a.Selector {
+		if b.Selector[k] != v {
+			return false
+		}
+	}
+	return true
 }

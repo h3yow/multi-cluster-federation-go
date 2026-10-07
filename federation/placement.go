@@ -7,39 +7,50 @@ import (
 )
 
 // placementView 是调度视角：站点已用容量与互斥占用。
-// 由当前实例集合构建，随每次试放置递增，保证同一轮协调内容量不超配。
+// 关键约束：视角只计入“已确认保留或已新放”的实例；按最新声明评估存量时，
+// 本轮即将腾出的占用不会被计入，从而既不会误判超配，也不会把可行实例误迁。
+// 随每次确认保留/试放置递增，保证同一轮协调内容量绝不超配。
 type placementView struct {
-	used  map[string]int             // site -> 已用容量
-	mutex map[string]map[string]bool // site -> mutexKey -> occupied
+	used  map[string]int               // site -> 已用容量
+	mutex map[string]map[string]string // site -> mutexKey -> 属主实例 ID
 }
 
-// newPlacementView 从实例集合构建调度视角。
+// newPlacementView 从实例集合构建调度视角（传 nil 得到空视角）。
 func newPlacementView(instances map[string]*Instance) *placementView {
 	v := &placementView{
 		used:  map[string]int{},
-		mutex: map[string]map[string]bool{},
+		mutex: map[string]map[string]string{},
 	}
 	for _, inst := range instances {
-		v.used[inst.Site] += inst.Size
-		if inst.MutexKey != "" {
-			if v.mutex[inst.Site] == nil {
-				v.mutex[inst.Site] = map[string]bool{}
-			}
-			v.mutex[inst.Site][inst.MutexKey] = true
-		}
+		v.occupy(inst)
 	}
 	return v
 }
 
-// occupy 把一次放置计入视角。
-func (v *placementView) occupy(site string, size int, mutexKey string) {
-	v.used[site] += size
-	if mutexKey != "" {
-		if v.mutex[site] == nil {
-			v.mutex[site] = map[string]bool{}
+// occupy 把一个实例（按其当前 Size/MutexKey）计入视角。
+func (v *placementView) occupy(inst *Instance) {
+	v.used[inst.Site] += inst.Size
+	if inst.MutexKey != "" {
+		if v.mutex[inst.Site] == nil {
+			v.mutex[inst.Site] = map[string]string{}
 		}
-		v.mutex[site][mutexKey] = true
+		v.mutex[inst.Site][inst.MutexKey] = inst.ID
 	}
+}
+
+// free 返回站点剩余容量。
+func (v *placementView) free(site *Site) int {
+	return site.Capacity - v.used[site.Name]
+}
+
+// mutexBlocked 判断 selfID 以 mutexKey 落在该站点时是否被其他实例挡住。
+// 属主是自己（如原地更新 Size）不算冲突。
+func (v *placementView) mutexBlocked(site, mutexKey, selfID string) bool {
+	if mutexKey == "" {
+		return false
+	}
+	owner := v.mutex[site][mutexKey]
+	return owner != "" && owner != selfID
 }
 
 // matchSelector 判断站点标签是否满足选择器（站点须包含全部键值）。
@@ -82,7 +93,7 @@ func chooseSite(spec *WorkloadSpec, ordinal int, sites map[string]*Site, v *plac
 			labelFailed = append(labelFailed, n)
 			continue
 		}
-		if spec.MutexKey != "" && v.mutex[n][spec.MutexKey] {
+		if v.mutexBlocked(n, spec.MutexKey, "") {
 			mutexFailed = append(mutexFailed, n)
 			continue
 		}
